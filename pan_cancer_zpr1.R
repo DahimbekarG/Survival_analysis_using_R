@@ -1,80 +1,72 @@
-#!/usr/bin/env Rscript
-# ============================================================
-# Pan-cancer ZPR1 survival analysis using TCGA RNA-seq data
+############################################################
+# Pan-cancer ZPR1 Kaplan–Meier survival analysis (TCGA)
+# Based on LUAD pipeline
 # Author: Ganesh Dahimbekar
-# Method: DESeq2 VST normalization + KM + Cox models
-# ============================================================
+############################################################
 
-# ---- Helpers to install packages ----
-install_if_missing_cran <- function(pkgs){
-  to_install <- pkgs[!sapply(pkgs, requireNamespace, quietly = TRUE)]
-  if(length(to_install))
-    install.packages(to_install, repos = "https://cloud.r-project.org", dependencies = TRUE)
-}
-install_if_missing_bioc <- function(pkgs){
-  if(!requireNamespace("BiocManager", quietly = TRUE))
-    install.packages("BiocManager", repos = "https://cloud.r-project.org")
-  to_install <- pkgs[!sapply(pkgs, requireNamespace, quietly = TRUE)]
-  if(length(to_install))
-    BiocManager::install(to_install, ask = FALSE, update = FALSE)
-}
+# ----------------------------
+# Load libraries
+# ----------------------------
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(survival)
+library(survminer)
+library(dplyr)
+library(tidyr)
 
-cran_pkgs <- c("dplyr","tidyr","ggplot2","survival","survminer")
-bioc_pkgs <- c("TCGAbiolinks","SummarizedExperiment","DESeq2")
-install_if_missing_cran(cran_pkgs)
-install_if_missing_bioc(bioc_pkgs)
-
-suppressPackageStartupMessages({
-  library(TCGAbiolinks)
-  library(SummarizedExperiment)
-  library(DESeq2)
-  library(dplyr)
-  library(tidyr)
-  library(survival)
-  library(survminer)
-  library(ggplot2)
-})
-
-dir.create("KM_plots", showWarnings = FALSE)
-
-message("===== TCGA PAN-CANCER ZPR1 SURVIVAL ANALYSIS =====")
-
-# Cancer projects
+# ----------------------------
+# TCGA cancer types to analyze
+# ----------------------------
 tcga_projects <- c(
   "TCGA-LUAD","TCGA-LUSC","TCGA-BRCA","TCGA-COAD",
   "TCGA-READ","TCGA-LIHC","TCGA-STAD","TCGA-PAAD",
   "TCGA-HNSC","TCGA-KIRC"
 )
 
-# ------------------------------------------------------------
-# Core function
-# ------------------------------------------------------------
-run_zpr1_survival <- function(project, min_samples = 30){
+# Output directories
+dir.create("KM_plots", showWarnings = FALSE)
+dir.create("Summary", showWarnings = FALSE)
 
-  message("\n--- Processing ", project, " ---")
+# ----------------------------
+# Initialize sample-size table
+# ----------------------------
+sample_summary <- data.frame()
 
-  # ---- Clinical ----
+# ----------------------------
+# Loop over cancer types
+# ----------------------------
+for (project in tcga_projects) {
+
+  message("\n==============================")
+  message("Processing ", project)
+  message("==============================")
+
+  # ----------------------------
+  # 1. Clinical data
+  # ----------------------------
   clinical <- tryCatch(
     GDCquery_clinic(project = project, type = "clinical"),
     error = function(e) NULL
   )
-  if (is.null(clinical)) return(NULL)
+  if (is.null(clinical)) next
 
-  clinical <- as.data.frame(clinical) %>%
+  clinical <- clinical %>%
     mutate(
-      deceased = ifelse(tolower(vital_status) == "dead", 1L, 0L),
+      deceased = ifelse(vital_status == "Dead", 1, 0),
       overall_survival = ifelse(
-        deceased == 1L,
+        vital_status == "Dead",
         days_to_death,
         days_to_last_follow_up
       )
     ) %>%
     select(submitter_id, deceased, overall_survival) %>%
-    filter(!is.na(overall_survival) & overall_survival > 0)
+    filter(!is.na(overall_survival))
 
-  if (nrow(clinical) < min_samples) return(NULL)
+  if (nrow(clinical) < 50) next
 
-  # ---- Expression ----
+  # ----------------------------
+  # 2. RNA-seq expression
+  # ----------------------------
   query <- GDCquery(
     project = project,
     data.category = "Transcriptome Profiling",
@@ -82,52 +74,63 @@ run_zpr1_survival <- function(project, min_samples = 30){
     workflow.type = "STAR - Counts",
     sample.type = "Primary Tumor"
   )
-  GDCdownload(query, method = "api", files.per.chunk = 20)
+
+  GDCdownload(query, method = "api")
   se <- GDCprepare(query)
 
-  counts <- assay(se, "unstranded")
-  gene_md <- as.data.frame(rowData(se))
-  if (!"gene_name" %in% colnames(gene_md)) return(NULL)
+  expr_matrix <- assay(se, "fpkm_unstrand")
+  gene_metadata <- as.data.frame(rowData(se))
 
-  zpr1_rows <- which(gene_md$gene_name == "ZPR1")
-  if (length(zpr1_rows) == 0) return(NULL)
+  # ----------------------------
+  # 3. Extract ZPR1 expression
+  # ----------------------------
+  zpr1_id <- gene_metadata %>%
+    filter(gene_name == "ZPR1") %>%
+    pull(gene_id)
 
-  # ---- Aggregate to patient level ----
-  patient_id <- substr(colnames(counts), 1, 12)
-  counts_pat <- t(sapply(split(seq_len(ncol(counts)), patient_id),
-                         function(i) rowSums(counts[, i, drop=FALSE])))
-  counts_pat <- t(counts_pat)
+  if (length(zpr1_id) == 0) next
 
-  # ---- DESeq2 VST ----
-  dds <- DESeqDataSetFromMatrix(
-    countData = counts_pat,
-    colData = DataFrame(row.names = colnames(counts_pat)),
-    design = ~1
-  )
-  dds <- estimateSizeFactors(dds)
-  vst_mat <- vst(dds, blind = TRUE)
+  zpr1_expr <- as.numeric(expr_matrix[zpr1_id, ])
+  names(zpr1_expr) <- colnames(expr_matrix)
 
-  zpr1_expr <- assay(vst_mat)[zpr1_rows[1], ]
-  expr_df <- data.frame(
-    submitter_id = colnames(vst_mat),
-    zpr1_expr = as.numeric(zpr1_expr)
+  zpr1_df <- data.frame(
+    submitter_id = substr(names(zpr1_expr), 1, 12),
+    zpr1_expr = zpr1_expr
   )
 
-  # ---- Merge ----
-  df <- left_join(expr_df, clinical, by = "submitter_id")
-  if (nrow(df) < min_samples) return(NULL)
+  # ----------------------------
+  # 4. Merge expression + clinical
+  # ----------------------------
+  df <- merge(zpr1_df, clinical, by = "submitter_id")
+  if (nrow(df) < 50) next
 
-  # ---- Median split ----
+  # ----------------------------
+  # 5. Median split
+  # ----------------------------
   med <- median(df$zpr1_expr, na.rm = TRUE)
-  df$group <- factor(
-    ifelse(df$zpr1_expr >= med, "High ZPR1", "Low ZPR1"),
-    levels = c("High ZPR1","Low ZPR1")
+  df$group <- ifelse(df$zpr1_expr >= med, "High ZPR1", "Low ZPR1")
+
+  # ----------------------------
+  # 6. Sample-size reporting
+  # ----------------------------
+  summary_row <- data.frame(
+    project = project,
+    n_total = nrow(df),
+    n_high = sum(df$group == "High ZPR1"),
+    n_low = sum(df$group == "Low ZPR1"),
+    n_events = sum(df$deceased),
+    median_followup_days = median(df$overall_survival, na.rm = TRUE)
   )
 
-  # ======================
-  # Kaplan–Meier plot
-  # ======================
-  fit <- survfit(Surv(overall_survival, deceased) ~ group, data = df)
+  sample_summary <- rbind(sample_summary, summary_row)
+
+  # ----------------------------
+  # 7. Kaplan–Meier analysis
+  # ----------------------------
+  fit <- survfit(
+    Surv(overall_survival, deceased) ~ group,
+    data = df
+  )
 
   km_plot <- ggsurvplot(
     fit,
@@ -136,57 +139,31 @@ run_zpr1_survival <- function(project, min_samples = 30){
     risk.table = TRUE,
     conf.int = FALSE,
     xlab = "Time (days)",
-    ylab = "Overall survival probability",
-    title = paste0("ZPR1 and Overall Survival in ", project),
-    legend.title = "Expression",
-    legend.labs = c("High ZPR1","Low ZPR1"),
-    risk.table.height = 0.25
+    ylab = "Overall Survival Probability",
+    title = paste0(project, ": ZPR1 Expression and Overall Survival"),
+    legend.title = "ZPR1 Expression",
+    legend.labs = c("High ZPR1", "Low ZPR1"),
+    risk.table.height = 0.35
   )
 
   ggsave(
-    filename = file.path("KM_plots", paste0("KM_ZPR1_", project, ".pdf")),
+    filename = paste0("KM_plots/", project, "_ZPR1_KM.pdf"),
     plot = km_plot$plot,
-    width = 7, height = 6
+    width = 6,
+    height = 5
   )
 
-  # ---- Cox ----
-  cox_cont <- coxph(Surv(overall_survival, deceased) ~ zpr1_expr, data = df)
-  cox_bin  <- coxph(Surv(overall_survival, deceased) ~ group, data = df)
-
-  data.frame(
-    project = project,
-    n = nrow(df),
-    HR_cont = exp(coef(cox_cont)),
-    p_cont = summary(cox_cont)$coefficients[,"Pr(>|z|)"],
-    HR_bin = exp(coef(cox_bin)),
-    p_bin = summary(cox_bin)$coefficients[,"Pr(>|z|)"]
-  )
+  message("KM plot saved for ", project)
 }
 
-# ------------------------------------------------------------
-# Run pan-cancer
-# ------------------------------------------------------------
-results <- lapply(tcga_projects, function(p)
-  tryCatch(run_zpr1_survival(p), error = function(e) NULL))
+# ----------------------------
+# Save sample-size summary
+# ----------------------------
+write.csv(
+  sample_summary,
+  "Summary/ZPR1_Pancancer_SampleSize.csv",
+  row.names = FALSE
+)
 
-pan_results <- bind_rows(results)
-write.csv(pan_results, "ZPR1_pan_cancer_survival_results.csv", row.names = FALSE)
-print(pan_results)
+message("\n===== PAN-CANCER ZPR1 KM ANALYSIS COMPLETE =====")
 
-# ------------------------------------------------------------
-# Forest plot
-# ------------------------------------------------------------
-if (nrow(pan_results) > 0) {
-  forest <- ggplot(pan_results, aes(x = reorder(project, HR_cont), y = HR_cont)) +
-    geom_point(size = 3) +
-    geom_hline(yintercept = 1, linetype = "dashed") +
-    coord_flip() +
-    ylab("Hazard Ratio (ZPR1 expression)") +
-    xlab("Cancer type") +
-    theme_bw() +
-    ggtitle("Pan-cancer ZPR1 survival association (TCGA)")
-
-  ggsave("ZPR1_pan_cancer_forest_plot.pdf", forest, width = 7, height = 5)
-}
-
-message("===== ANALYSIS COMPLETE =====")
