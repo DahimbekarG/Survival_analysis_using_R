@@ -4,69 +4,45 @@
 # Author: Ganesh Dahimbekar
 ############################################################
 
-# ----------------------------
-# Load libraries
-# ----------------------------
+# 1. Load Essential Libraries
 library(TCGAbiolinks)
 library(SummarizedExperiment)
 library(survival)
 library(survminer)
 library(dplyr)
-library(tidyr)
+library(httr)
 
-# ----------------------------
-# TCGA cancer types to analyze
-# ----------------------------
-tcga_projects <- c(
-  "TCGA-LUAD","TCGA-LUSC","TCGA-BRCA","TCGA-COAD",
-  "TCGA-READ","TCGA-LIHC","TCGA-STAD","TCGA-PAAD",
-  "TCGA-HNSC","TCGA-KIRC"
-)
-
-# Create output directory
+# 2. Setup Working Environment
+# Critical for Windows: Use a very short path to avoid GDCprepare errors
+work_dir <- "C:/TCGA_ZPR1"
+if(!dir.exists(work_dir)) dir.create(work_dir)
+setwd(work_dir)
 dir.create("KM_plots", showWarnings = FALSE)
 
-# ----------------------------
-# Loop over cancer types
-# ----------------------------
+# Increase timeout for large 2026 GDC files
+options(timeout = 600) 
+
+tcga_projects <- c("TCGA-LUAD", "TCGA-LUSC", "TCGA-BRCA", "TCGA-COAD", 
+                   "TCGA-READ", "TCGA-LIHC", "TCGA-STAD", "TCGA-PAAD", 
+                   "TCGA-HNSC", "TCGA-KIRC")
+
+# 3. Processing Loop
 for (project in tcga_projects) {
+  message("\nProcessing: ", project)
   
-  message("\n==============================")
-  message("Processing ", project)
-  message("==============================")
+  # --- Step A: Clinical Data ---
+  clinical <- tryCatch({ GDCquery_clinic(project = project, type = "clinical") }, 
+                       error = function(e) return(NULL))
   
-  # ----------------------------
-  # 1. Clinical data
-  # ----------------------------
-  clinical <- tryCatch(
-    GDCquery_clinic(project = project, type = "clinical"),
-    error = function(e) NULL
-  )
-  if (is.null(clinical)) {
-    message("Clinical data not available for ", project)
-    next
-  }
+  if (is.null(clinical) || nrow(clinical) == 0) next
   
-  clinical <- clinical %>%
-    mutate(
-      deceased = ifelse(vital_status == "Dead", 1, 0),
-      overall_survival = ifelse(
-        vital_status == "Dead",
-        days_to_death,
-        days_to_last_follow_up
-      )
-    ) %>%
-    select(submitter_id, deceased, overall_survival) %>%
-    filter(!is.na(overall_survival))
+  clinical_clean <- clinical %>%
+    mutate(deceased = ifelse(vital_status == "Dead", 1, 0),
+           overall_survival = ifelse(vital_status == "Dead", days_to_death, days_to_last_follow_up)) %>%
+    filter(!is.na(overall_survival) & overall_survival > 0) %>%
+    distinct(submitter_id, .keep_all = TRUE) # Prevents duplication errors
   
-  if (nrow(clinical) < 50) {
-    message("Too few clinical samples for ", project)
-    next
-  }
-  
-  # ----------------------------
-  # 2. RNA-seq expression
-  # ----------------------------
+  # --- Step B: Gene Expression Query ---
   query <- GDCquery(
     project = project,
     data.category = "Transcriptome Profiling",
@@ -75,88 +51,55 @@ for (project in tcga_projects) {
     sample.type = "Primary Tumor"
   )
   
-  GDCdownload(query, method = "api")
-  se <- GDCprepare(query)
+  # --- Step C: Robust Download (Fixes "Truncated tar" error) ---
+  # Retries with small chunks or the official GDC-Client if API fails
+  tryCatch({
+    GDCdownload(query, method = "api", files.per.chunk = 15)
+  }, error = function(e) {
+    message("API failed for ", project, ". Attempting 'client' method...")
+    GDCdownload(query, method = "client")
+  })
   
-  # Use FPKM (as in your LUAD code)
-  expr_matrix <- assay(se, "fpkm_unstrand")
-  gene_metadata <- as.data.frame(rowData(se))
+  # --- Step D: Prepare & Extract ZPR1 ---
+  # Explicitly naming the directory avoids the GDCprepare "not found" error
+  se <- GDCprepare(query, directory = "GDCdata")
   
-  # ----------------------------
-  # 3. Extract ZPR1 expression
-  # ----------------------------
-  zpr1_id <- gene_metadata %>%
-    filter(gene_name == "ZPR1") %>%
-    pull(gene_id)
+  # Dynamic assay detection (FPKM name may vary slightly in 2026)
+  assay_target <- grep("fpkm_unstrand", assayNames(se), value = TRUE)[1]
+  if(is.na(assay_target)) assay_target <- "fpkm_unstranded"
   
-  if (length(zpr1_id) == 0) {
-    message("ZPR1 not found in ", project)
-    next
-  }
+  expr_matrix <- assay(se, assay_target)
+  zpr1_id <- rownames(rowData(se)[rowData(se)$gene_name == "ZPR1", , drop=FALSE])
   
-  zpr1_expr <- as.numeric(expr_matrix[zpr1_id, ])
-  names(zpr1_expr) <- colnames(expr_matrix)
+  if (length(zpr1_id) == 0) { message("ZPR1 missing in ", project); next }
   
   zpr1_df <- data.frame(
-    submitter_id = substr(names(zpr1_expr), 1, 12),
-    zpr1_expr = zpr1_expr,
+    submitter_id = substr(colnames(expr_matrix), 1, 12),
+    zpr1_expr = as.numeric(expr_matrix[zpr1_id, ]),
     stringsAsFactors = FALSE
-  )
+  ) %>% group_by(submitter_id) %>% summarize(zpr1_expr = mean(zpr1_expr))
   
-  # ----------------------------
-  # 4. Merge expression + clinical
-  # ----------------------------
-  df <- merge(
-    zpr1_df,
-    clinical,
-    by = "submitter_id"
-  )
+  # --- Step E: Merge & Survival Analysis ---
+  df_final <- inner_join(zpr1_df, clinical_clean, by = "submitter_id")
+  if(nrow(df_final) < 20) next
   
-  if (nrow(df) < 50) {
-    message("Too few merged samples for ", project)
-    next
-  }
+  df_final$group <- ifelse(df_final$zpr1_expr >= median(df_final$zpr1_expr), "High", "Low")
+  fit <- survfit(Surv(overall_survival, deceased) ~ group, data = df_final)
   
-  # ----------------------------
-  # 5. Median split
-  # ----------------------------
-  med <- median(df$zpr1_expr, na.rm = TRUE)
-  df$group <- ifelse(df$zpr1_expr >= med, "High ZPR1", "Low ZPR1")
+  # --- Step F: Save Results ---
+  p <- ggsurvplot(fit, data = df_final, pval = TRUE, risk.table = TRUE,
+                  title = paste(project, "ZPR1 Survival"))
   
-  # ----------------------------
-  # 6. Kaplan–Meier analysis
-  # ----------------------------
-  fit <- survfit(
-    Surv(overall_survival, deceased) ~ group,
-    data = df
-  )
+  pdf(file.path("KM_plots", paste0(project, "_ZPR1.pdf")), onefile = FALSE)
+  print(p)
+  dev.off()
   
-  km_plot <- ggsurvplot(
-    fit,
-    data = df,
-    pval = TRUE,
-    risk.table = TRUE,
-    conf.int = FALSE,
-    xlab = "Time (days)",
-    ylab = "Overall Survival Probability",
-    title = paste0(project, ": ZPR1 Expression and Overall Survival"),
-    legend.title = "ZPR1 Expression",
-    legend.labs = c("High ZPR1", "Low ZPR1"),
-    risk.table.height = 0.35
-  )
-  
-  # ----------------------------
-  # 7. Save plot
-  # ----------------------------
-  ggsave(
-    filename = paste0("KM_plots/", project, "_ZPR1_KM.pdf"),
-    plot = km_plot$plot,
-    width = 6,
-    height = 5
-  )
-  
-  message("KM plot saved for ", project)
+  # --- Step G: Memory Cleanup (Prevents R session crashes) ---
+  rm(se, expr_matrix, query, df_final, clinical, zpr1_df)
+  gc()
 }
+
+message("\nAnalysis Complete. Plots saved to: ", getwd(), "/KM_plots")
 
 message("\n===== PAN-CANCER ZPR1 KM ANALYSIS COMPLETE =====")
 
